@@ -1,12 +1,17 @@
 #!/usr/bin/env node
 /**
- * GS-Helper daily data updater.
+ * GS-Helper daily data updater (v2).
  *
  * Usage:  node scripts/update-data.mjs <path-to-GSReact-clone> [--index index.html] [--dry-run]
  *
  * Pulls fresh unit / tier / equipment data from a local clone of
  * https://github.com/Reymdusk/GSReact (the source of grandsummoners.info)
  * and rewrites the embedded <script type="text/plain"> data blocks in index.html.
+ *
+ * v2: GSReact stores data as JavaScript modules (unquoted keys, single quotes,
+ * `export const X = [...]`), not JSON. Data files are now evaluated inside a
+ * bare `node:vm` sandbox — no require/import, no fs, no network, no process,
+ * 2s timeout — so pure data literals parse and anything else is skipped.
  *
  * Safety model — the script NEVER makes the site worse:
  *   • Append-only for units, kits, slots, equips, images (nothing is ever removed).
@@ -19,6 +24,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import vm from "node:vm";
 
 const args = process.argv.slice(2);
 const SRC_DIR = args.find(a => !a.startsWith("--"));
@@ -73,35 +79,47 @@ log(`current snapshot: ${cur.units.length} units, ${cur.eq.length} equips, ${cur
 
 /* ---------------- 2. discover & parse candidate data files ---------------- */
 
+const SKIP_FILES = /^(package(-lock)?\.json|manifest\.json|settings\.json|tsconfig.*\.json|.*\.config\.(js|mjs|cjs|json)|.*\.test\.(js|mjs|ts)|.*\.min\.js)$/i;
+
 function* walk(dir) {
   for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (ent.name === "node_modules" || ent.name.startsWith(".git")) continue;
+    if (ent.name === "node_modules" || ent.name.startsWith(".git") || ent.name === ".vscode") continue;
     const p = path.join(dir, ent.name);
     if (ent.isDirectory()) yield* walk(p);
     else yield p;
   }
 }
 
-/** Try hard to get JSON out of a .json or data-only .js file (no code execution). */
+/**
+ * v2 parser. JSON files -> JSON.parse. JS/TS module files -> evaluate in a bare
+ * vm sandbox (no globals, no require/import, 2s timeout). Import lines are
+ * stripped; `export default X` and `export const NAME = X` are captured. Files
+ * with real logic (functions, JSX, requires) simply throw inside the sandbox
+ * and are skipped — only pure data literals survive, which is exactly what we want.
+ */
 function parseDataFile(p) {
   let text;
-  try { text = fs.readFileSync(p, "utf8"); } catch { return null; }
-  if (text.length > 30_000_000) return null;
-  if (p.endsWith(".json")) { try { return JSON.parse(text); } catch { return null; } }
-  // .js: strip common wrappers, then attempt to JSON.parse the largest bracketed literal.
-  const stripped = text
-    .replace(/export\s+default\s+/g, "")
-    .replace(/module\.exports\s*=\s*/g, "")
-    .replace(/(?:const|let|var)\s+\w+\s*=\s*/g, "");
-  for (const open of ["[", "{"]) {
-    const close = open === "[" ? "]" : "}";
-    const i = stripped.indexOf(open);
-    if (i < 0) continue;
-    const j = stripped.lastIndexOf(close);
-    if (j <= i) continue;
-    try { return JSON.parse(stripped.slice(i, j + 1)); } catch { /* not pure JSON */ }
+  try { text = fs.readFileSync(p, "utf8"); } catch { return { data: null, note: "unreadable" }; }
+  if (text.length > 30_000_000) return { data: null, note: "too large" };
+  if (p.endsWith(".json")) {
+    try { return { data: JSON.parse(text) }; } catch { return { data: null, note: "bad JSON" }; }
   }
-  return null;
+  if (!/[\[{]/.test(text)) return { data: null, note: "no literals" };
+  const prepped = text
+    .replace(/^\s*import[^;\n]*;?\s*$/gm, "")                 // strip import lines
+    .replace(/^\s*export\s+default\s+/m, "__ret = ")           // capture default export
+    .replace(/export\s+(const|let|var)\s+(\w+)\s*=/g, "__all.$2 =") // capture named exports
+    .replace(/module\.exports\s*=\s*/g, "__ret = ")
+    .replace(/^\s*export\s*\{[^}]*\}\s*;?\s*$/gm, "");
+  const sandbox = { __all: {}, __ret: undefined };
+  try {
+    vm.runInNewContext(prepped, sandbox, { timeout: 2000, filename: p });
+  } catch (e) { return { data: null, note: "eval: " + String(e.message).slice(0, 60) }; }
+  const named = Object.keys(sandbox.__all).length ? sandbox.__all : null;
+  const data = sandbox.__ret !== undefined
+    ? (named ? { __default: sandbox.__ret, ...named } : sandbox.__ret)
+    : named;
+  return data ? { data } : { data: null, note: "no exports captured" };
 }
 
 /** Collect every array-of-plain-objects (len>=25) nested anywhere in a value. */
@@ -111,7 +129,6 @@ function collectArrays(v, out = [], depth = 0) {
     if (v.length >= 25 && v.every(x => x && typeof x === "object" && !Array.isArray(x))) out.push(v);
     else v.forEach(x => collectArrays(x, out, depth + 1));
   } else if (typeof v === "object") {
-    // an object whose values are all plain objects is a keyed collection — treat values as an array
     const vals = Object.values(v);
     if (vals.length >= 25 && vals.every(x => x && typeof x === "object" && !Array.isArray(x))) out.push(vals);
     vals.forEach(x => collectArrays(x, out, depth + 1));
@@ -119,17 +136,26 @@ function collectArrays(v, out = [], depth = 0) {
   return out;
 }
 
-const parsedFiles = [];
+const parsedFiles = [], scanned = [];
 for (const p of walk(SRC_DIR)) {
-  if (!/\.(json|js)$/.test(p)) continue;
-  const data = parseDataFile(p);
+  if (!/\.(json|js|mjs|cjs|ts)$/.test(p)) continue;
+  if (SKIP_FILES.test(path.basename(p))) continue;
+  const size = fs.statSync(p).size;
+  const { data, note } = parseDataFile(p);
+  scanned.push({ p, size, ok: !!data, note: note || "ok" });
   if (data) parsedFiles.push({ p, data });
 }
-log(`parsed ${parsedFiles.length} data files from source repo`);
-if (parsedFiles.length === 0) fail("no parseable JSON/JS data files found in source clone — has the repo layout changed?");
+log(`scanned ${scanned.length} candidate files, parsed ${parsedFiles.length}`);
+
+function discoveryReport() {
+  const rows = scanned.sort((a, b) => b.size - a.size).slice(0, 25)
+    .map(s => `  ${s.ok ? "✓" : "✗"} ${(s.size/1024).toFixed(0).padStart(6)} KB  ${path.relative(SRC_DIR, s.p)}  ${s.ok ? "" : "(" + s.note + ")"}`);
+  return "Largest candidate files (✓ parsed / ✗ skipped):\n" + rows.join("\n");
+}
+if (parsedFiles.length === 0) fail("no parseable data files found in source clone.\n" + discoveryReport());
 
 const candidates = [];
-for (const f of parsedFiles) for (const arr of collectArrays(f.data)) candidates.push({ file: f.p, arr, raw: f.data });
+for (const f of parsedFiles) for (const arr of collectArrays(f.data)) candidates.push({ file: f.p, arr });
 
 /* ---------------- 3. field mapping helpers ---------------- */
 
@@ -157,7 +183,6 @@ function longTextKeys(arr) {
     return vals.length && vals.reduce((a, v) => a + v.length, 0) / vals.length > 40;
   });
 }
-/** All string content of an object, flattened (for trait keyword scanning). */
 function allText(o, depth = 0) {
   if (depth > 4 || o == null) return "";
   if (typeof o === "string") return o + " ";
@@ -178,7 +203,15 @@ function pickBest(known, minHits) {
 }
 const unitSrc  = pickBest(knownUnitNames, 50);
 const equipSrc = pickBest(knownEquipNames, 50);
-if (!unitSrc)  fail("could not identify the UNIT data file (no candidate matched >=50 known unit names). Run with the discovery log below and adjust.\nFiles parsed:\n" + parsedFiles.map(f => "  " + f.p).join("\n"));
+if (!unitSrc) {
+  // help the next debugging round: show the best scores we DID see
+  const scores = candidates.map(c => {
+    const { key, score } = bestKeyBy(c.arr, k => nameHitScore(c.arr, k, knownUnitNames));
+    return { f: path.relative(SRC_DIR, c.file), len: c.arr.length, key, score };
+  }).sort((a, b) => b.score - a.score).slice(0, 10)
+    .map(s => `  ${s.score} unit-name hits via '${s.key}' in ${s.f} (array len ${s.len})`);
+  fail("could not identify the UNIT data file (no candidate matched >=50 known unit names).\nBest candidates seen:\n" + (scores.join("\n") || "  (none)") + "\n" + discoveryReport());
+}
 if (!equipSrc) warn("could not identify the EQUIPMENT data file — equips will not be updated this run.");
 log(`unit source:  ${unitSrc.file}  (${unitSrc.score} name hits, nameKey='${unitSrc.nameKey}')`);
 if (equipSrc) log(`equip source: ${equipSrc.file}  (${equipSrc.score} name hits, nameKey='${equipSrc.nameKey}')`);
@@ -188,7 +221,7 @@ if (equipSrc) log(`equip source: ${equipSrc.file}  (${equipSrc.score} name hits,
 function findTierSource() {
   let best = null;
   for (const c of candidates) {
-    const { key, score } = bestKeyBy(c.arr, k => {
+    const { key } = bestKeyBy(c.arr, k => {
       const vals = strVals(c.arr, k); if (!vals.length) return 0;
       const hit = vals.filter(v => TIERSET.has(v.trim().toUpperCase())).length;
       return hit / vals.length >= 0.8 ? hit : 0;
@@ -275,11 +308,11 @@ const clean = s => String(s ?? "").replace(/\|/g, "/").replace(/\s*\n\s*/g, " ")
 const report = { newUnits: [], newEquips: [], tierRebuilt: false, tierMoved: 0, newUImg: 0, newEImg: 0 };
 
 /* --- 6a. new units + kits + slots + images --- */
-const uEl  = elementKey(unitSrc.arr);
+const uEl = elementKey(unitSrc.arr);
 if (!uEl.key) fail("unit source found but no element field could be identified.");
 const uImgKey = bestKeyBy(unitSrc.arr, k =>
-  strVals(unitSrc.arr, k).filter(v => knownUnitImgIds.has(v.trim())).length).key;
-const uTextKeys = longTextKeys(unitSrc.arr);
+  strVals(unitSrc.arr, k).filter(v => knownUnitImgIds.has(v.trim())).length).key
+  || bestKeyBy(unitSrc.arr, k => (/thumb|img|icon/i.test(k) ? 1 : 0)).key;
 const slotKey = bestKeyBy(unitSrc.arr, k => {
   let hit = 0;
   unitSrc.arr.slice(0, 60).forEach(o => {
@@ -288,7 +321,7 @@ const slotKey = bestKeyBy(unitSrc.arr, k => {
   });
   return hit;
 }).key;
-log(`unit fields — element:'${uEl.key}' img:'${uImgKey || "-"}' slots:'${slotKey || "-"}' text:[${uTextKeys.join(",")}]`);
+log(`unit fields — element:'${uEl.key}' img:'${uImgKey || "-"}' slots:'${slotKey || "-"}'`);
 
 const addUnitLines = [], addKitLines = [], addSlotLines = [], addUImgLines = [];
 for (const o of unitSrc.arr) {
@@ -333,7 +366,7 @@ if (equipSrc) {
   const eImgKey = bestKeyBy(a, k =>
     strVals(a, k).filter(v => cur.eImg.some(l => l.endsWith("|" + v.trim()))).length).key
     || bestKeyBy(a, k => (/thumb|img|icon/i.test(k) ? 1 : 0)).key;
-  log(`equip fields — type:'${typeKey || "-"}' star:'${starKey || "-"}' atk/hp/def:'${atkKey || "-"}/${hpKey || "-"}/${defKey || "-"}' loc:'${locKey || "-"}' img:'${eImgKey || "-"}' effect:[${effKeys.join(",")}]`);
+  log(`equip fields — type:'${typeKey || "-"}' star:'${starKey || "-"}' atk/hp/def:'${atkKey || "-"}/${hpKey || "-"}/${defKey || "-"}' loc:'${locKey || "-"}' img:'${eImgKey || "-"}'`);
   if (typeKey && starKey) {
     for (const o of a) {
       const name = clean(o[equipSrc.nameKey]);
@@ -380,7 +413,7 @@ if (tierSrc) {
 
 /* ---------------- 7. validate + write ---------------- */
 
-const changed = addUnitLines.length || addEqLines.length || report.tierRebuilt && report.tierMoved > 0
+const changed = addUnitLines.length || addEqLines.length || (report.tierRebuilt && report.tierMoved > 0)
   || (newTierLines && newTierLines.join("\n") !== cur.tierLines.join("\n"));
 if (!changed) { log("no data changes today — index.html left untouched."); process.exit(0); }
 

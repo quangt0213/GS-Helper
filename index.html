@@ -246,7 +246,7 @@
       <p class="small muted">Main Story is listed chapter by chapter (Chapters 1–38; Global is at Ch.38 per the site changelog). Story stages mix elements and there is no published per-stage element table anywhere, so chapters are treated as mixed-element: the builder recommends your highest-tier balanced team rather than an element counter.</p>
       <p class="small muted"><b>Giant Bosses</b> — the hardest content players actually struggle on — are fully modelled from the community <a href="https://gachazone.com/grand-summoners-giant-boss-guide/" target="_blank">Giant Boss guide</a>: all 18 (Degilmagna, Oldeus, Fosradius, Elpneumas, XTF Eraser, Freydal, Flogassa, Valzendeth, Ifrit, Palamicia, Aerugraxes, Tonetaurus, Mavroskia, Ragsherum, Goldola, O'zagun, Wilkes…). Each boss's element is derived from its resistance weakness (a "-X% Earth Res" boss is weak to Earth, so it's a Water boss), and its counter-needs (paralysis, burn, freeze, break, mitigation, cleanse) come straight from its mechanics — so the Team Builder picks a real counter team and the Priorities tab points you at the right farm equips. Note: the game has no public per-EX-stage table; these Giant Boss raids are the equivalent hard fights.</p>
       <h3>Team Builder logic</h3>
-      <p class="small muted">Each owned unit is scored for the selected fight: element advantage (Fire→Earth→Water→Fire, Light↔Dark = +20% dmg / −20% taken), matching the boss's counter traits (paralysis vs Palamicia, burn vs Aerugraxes' freeze-regen, Breaker + true damage vs break-only Ragsherum), an owned <b>True Weapon</b> bonus (⚔️ tag it via ✎), and role coverage (arts battery, healer, breaker). <b>Tier is a tiebreak only, capped so it can never outrank a required counter mechanic</b> — a correctly-tagged C-tier Breaker beats an off-kit SS nuker on a break-only boss. Slots are then filled by <b>marginal team gain</b>, not raw individual score: stacking the counter element compounds elemental buffs/debuffs, supports whose element matches your damage dealers get a synergy bonus (element-locked buffs actually land), and stacking multiple units weak to the boss is penalized. Reasoning is shown per pick.</p>
+      <p class="small muted">Each owned unit is scored for the selected fight: element advantage (Fire→Earth→Water→Fire, Light↔Dark = +20% dmg / −20% taken), matching the boss's <b>curated counter mechanics</b> (paralysis vs Palamicia, burn vs Aerugraxes' freeze-regen, Breaker + true damage vs break-only Ragsherum) — these are the only <i>hard</i> requirements — plus an owned <b>True Weapon</b> bonus (⚔️ tag it via ✎). <b>Tier is a tiebreak only, capped so it can never outrank a required counter mechanic</b> — a correctly-tagged C-tier Breaker beats an off-kit SS nuker on a break-only boss. Slots are then filled by <b>marginal team gain</b>: stacking the counter element compounds elemental buffs/debuffs, supports whose element matches your damage dealers get a synergy bonus (element-locked buffs actually land), and stacking multiple units weak to the boss is penalized. Arts battery and healer are <b>soft coverage</b> preferences, not forced slots — because auto-derived trait tags are imperfect, forcing a "battery" could displace a stronger unit, so a battery/healer is preferred only when it doesn't cost you a better pick. Equipment suggestions respect each unit's <b>per-slot star cap</b> (set real caps via ✎), so you're never told to slot gear the unit can't hold. Reasoning is shown per pick.</p>
       <h3>Data freshness</h3>
       <p class="small muted">Tiers, kits, equips and images were last refreshed on <b id="dataStamp2">—</b>. A GitHub Action (<code>.github/workflows/update-data.yml</code>) runs <b>daily</b>: it pulls the latest data from the grandsummoners.info source repo, appends any new units/equipment, rebuilds the tier list, validates everything, and commits — so the site updates itself. New units get auto-derived roles/traits (heuristic); per-unit ✎ edits always override snapshot data and survive updates via 💾 Save.</p>
       <h3>Priority logic</h3>
@@ -283,6 +283,10 @@
   <label class="f" style="display:flex;align-items:center;gap:7px;cursor:pointer;margin-top:12px">
     <input type="checkbox" id="uTW"> <span>⚔️ I own this unit's <b>True Weapon</b> <span class="muted">(big boost in team scoring)</span></span>
   </label>
+  <div id="uSlotWrap" style="margin-top:12px">
+    <label class="f">Equip slot star caps <span class="muted">(max rarity each slot accepts — the builder won't suggest gear above the cap)</span></label>
+    <div class="row" id="uSlots" style="gap:8px;flex-wrap:wrap"></div>
+  </div>
   <div class="row" style="margin-top:16px;justify-content:space-between">
     <button class="btn ghost sm" id="uOwnToggle">Toggle owned</button>
     <div class="row">
@@ -1237,7 +1241,7 @@ Light|Healer|Cathemilla|artsBattery,paralysis,freeze,mitigation
 Dark|Attacker|Mizyna|
 Water|Healer|Nies|artsBattery,freeze,burn,mitigation
 Fire|Attacker|Sanstone|paralysis,freeze,burn,mitigation
-Light|Support|Platina|artsBattery,cleanse
+Light|Support|Platina|cleanse
 Earth|Healer|Parlot|artsBattery,freeze
 Dark|Attacker|Dahlia|artsBattery
 Water|Support|Gaia|artsBattery,mitigation
@@ -1613,7 +1617,8 @@ Fire|Attacker|Choi Jong-In|
 Dark|Support|Igris|artsBattery,mitigation,revive
 </script>
 
-<!-- Per-unit equipment slot types (phys/mag/supp/heal/def; "/" = choice). From the site data bundle. Format: Name|s1,s2,s3 -->
+<!-- Per-unit equipment slot types (phys/mag/supp/heal/def; "/" = choice). From the site data bundle. Format: Name|s1,s2,s3
+     Each slot may carry an optional star cap as "type:cap" (max rarity it accepts), e.g. "phys:4"; no cap = unrestricted (≤5★). -->
 <script type="text/plain" id="slotData">
 Clyde|phys,phys,def
 Corsair|mag,phys,def
@@ -4225,6 +4230,21 @@ let TIER_MATCHED=0;
 })();
 
 /* ---------------- APPLY EQUIP SLOTS ---------------- */
+/* Highest equipment rarity that exists in the data. Each unit's slot has its own
+   star cap (in GS you can't slot gear above a slot's rarity); when a cap is
+   unknown we treat it as unrestricted (= MAX_EQUIP_STAR). */
+const MAX_EQUIP_STAR=5;
+const SLOT_ABBR={phys:"Phys",mag:"Mag",supp:"Sup",heal:"Heal",def:"Def"};
+function slotTypeLabel(type){ return String(type).split("/").map(x=>SLOT_ABBR[x]||x).join("/"); }
+function slotCapLabel(cap){ return (cap<MAX_EQUIP_STAR)?` ≤${cap}★`:""; }
+/* a slot token is "type" or "type:cap", where type may be multi ("def/phys"),
+   e.g. "phys", "supp:4", "def/phys:5". Returns {type, cap}. */
+function parseSlot(tok){
+  const [typePart, capPart]=String(tok).split(":");
+  let cap=MAX_EQUIP_STAR;
+  if(capPart!==undefined && capPart!==""){ const n=parseInt(capPart,10); if(!isNaN(n)) cap=Math.max(1,Math.min(MAX_EQUIP_STAR,n)); }
+  return {type:typePart, cap};
+}
 let SLOT_MATCHED=0;
 (function applySlots(){
   const L=buildLookups();
@@ -4233,7 +4253,7 @@ let SLOT_MATCHED=0;
     const p=line.split("|"); if(p.length<2) return;
     const m=p[0].match(/\(([^)]+)\)\s*$/); const el=(m&&ELSET.has(m[1]))?m[1]:null;
     const u=matchUnit(L, p[0], el);
-    if(u){ u.slots=p[1].split(","); SLOT_MATCHED++; }
+    if(u){ u.slots=p[1].split(",").map(parseSlot); SLOT_MATCHED++; }
   });
 })();
 
@@ -4281,10 +4301,14 @@ try{ ownedEq=new Set(JSON.parse(localStorage.getItem("gs_ownedEq")||"[]")); }cat
 function saveOwnedEq(){ try{ localStorage.setItem("gs_ownedEq", JSON.stringify([...ownedEq])); }catch(e){} }
 /* pick the best equip for a slot type, biased toward the fight's needs.
    If the player has marked any owned equips, only suggest from those. */
-function suggestEquip(slotType, c){
+function suggestEquip(slot, c){
+  const slotType = (typeof slot==="string") ? slot : slot.type;
+  const cap = (typeof slot==="string") ? MAX_EQUIP_STAR : (slot.cap||MAX_EQUIP_STAR);
   const needs=(c&&c.need)||[];
   const useOwned = ownedEq.size>0;
-  const cands=EQUIPS.filter(e=>slotType.split("/").includes(e.type) && (!useOwned || ownedEq.has(e.name)));
+  const types=slotType.split("/");
+  /* Only gear the slot can actually hold: e.star must be <= the slot's cap. */
+  const cands=EQUIPS.filter(e=>types.includes(e.type) && e.star<=cap && (!useOwned || ownedEq.has(e.name)));
   let best=null, bestScore=-1;
   cands.forEach(e=>{
     let s=e.star*2 + e.atk/500;
@@ -4408,11 +4432,13 @@ const BOSS_COMPS = {
 let owned = new Set();
 function applyEdits(){
   let edits={}; try{ edits=JSON.parse(localStorage.getItem("gs_edits")||"{}"); }catch(e){}
-  UNITS.forEach(u=>{ const e=edits[u.name]; if(e){ if(e.role)u.role=e.role; if(e.traits)u.traits=e.traits; if(e.tier!==undefined)u.tier=e.tier; if(e.el&&BEATS[e.el])u.el=e.el; if(e.tw!==undefined)u.tw=e.tw; } });
+  UNITS.forEach(u=>{ const e=edits[u.name]; if(e){ if(e.role)u.role=e.role; if(e.traits)u.traits=e.traits; if(e.tier!==undefined)u.tier=e.tier; if(e.el&&BEATS[e.el])u.el=e.el; if(e.tw!==undefined)u.tw=e.tw;
+    if(e.slotCaps && u.slots){ e.slotCaps.forEach((cap,i)=>{ if(u.slots[i]) u.slots[i].cap=cap; }); } } });
 }
 function saveEdit(u){
   let edits={}; try{ edits=JSON.parse(localStorage.getItem("gs_edits")||"{}"); }catch(e){}
-  edits[u.name]={role:u.role,traits:u.traits,tier:u.tier,el:u.el,tw:!!u.tw};
+  edits[u.name]={role:u.role,traits:u.traits,tier:u.tier,el:u.el,tw:!!u.tw,
+    slotCaps:(u.slots&&u.slots.length)?u.slots.map(s=>s.cap):undefined};
   try{ localStorage.setItem("gs_edits", JSON.stringify(edits)); }catch(e){}
 }
 function loadState(){
@@ -4491,7 +4517,7 @@ function renderGrid(){
         <div class="meta">${u.role}${u.tier?` · <b class="chip t">${u.tier}</b>`:""}${u.tw?` <b class="chip tw">TW</b>`:""}</div>
       </div></div>
       ${chips?`<div>${chips}</div>`:""}
-      ${u.slots?`<div class="slotline">🛡 ${u.slots.map(s=>s.split("/").map(t=>SLOT_SHORT[t]||t).join("/")).join(" · ")}</div>`:""}`;
+      ${u.slots?`<div class="slotline">🛡 ${u.slots.map(s=>slotTypeLabel(s.type)+slotCapLabel(s.cap)).join(" · ")}</div>`:""}`;
     d.onclick=(ev)=>{ if(ev.target.dataset.edit){ openEdit(u); return; }
       owned.has(u.id)?owned.delete(u.id):owned.add(u.id); saveOwned(); renderGrid(); updateCount(); };
     g.appendChild(d);
@@ -4511,8 +4537,9 @@ function scoreUnit(u, c){
   u.traits.forEach(t=>{ if(needs.includes(t)){ s+=5; reasons.push(`+ Provides ${TRAIT_LABEL[t]||t} (needed here)`);} });
   if(needs.includes("break") && u.role==="Breaker"){ s+=6; reasons.push("+ Breaker for break-only boss"); }
   if(u.tw){ s+=3; reasons.push("+ True Weapon owned"); }
-  if(u.role==="Support" && u.traits.includes("artsBattery")){ s+=2; reasons.push("+ Arts battery (fuels team)"); }
-  if(u.role==="Healer"){ s+=1; }
+  /* No flat arts-battery or healer bonus here: trait/role tags are imperfect, so
+     battery and healer value is applied as team coverage in synergyBonus() —
+     awarded once each, only when the team actually lacks one. */
   if(u.traits.includes("trueDamage")){ s+=1; reasons.push("+ True damage (ignores resist/def)"); }
   /* Tier is a tiebreak, capped at +3 so it can never outrank a required counter mechanic (+5/+6).
      A rightly-tagged C-tier breaker beats an off-kit SS nuker on a break-only boss. */
@@ -4529,6 +4556,12 @@ function synergyBonus(team, cand, c){
   if(cand.u.role==="Support" && team.some(p=>isDps(p.u.role)&&p.u.el===cand.u.el)){ b+=2; why.push(`+ ${cand.u.el} support aligns with your ${cand.u.el} damage (element-locked buffs land)`); }
   if(isDps(cand.u.role) && team.some(p=>p.u.role==="Support"&&p.u.el===cand.u.el)){ b+=2; why.push(`+ Benefits from your ${cand.u.el} support's buffs`); }
   if(c.enemyEl && advantage(cand.u.el,c.enemyEl)<0 && team.some(p=>advantage(p.u.el,c.enemyEl)<0)){ b-=2; why.push(`− Second unit weak to ${c.enemyEl} (risky stacking)`); }
+  /* Soft coverage: reward the FIRST battery / healer so balanced teams win ties,
+     but the bonus is small enough that a stronger non-battery still gets picked —
+     a mislabeled "battery" can no longer crowd out a better unit. */
+  const isBattery=p=>p.u.role==="Support" && p.u.traits.includes("artsBattery");
+  if(isBattery(cand) && !team.some(isBattery)){ b+=2; why.push("+ Adds an arts battery (team had none)"); }
+  if(cand.u.role==="Healer" && !team.some(p=>p.u.role==="Healer")){ b+=1.5; why.push("+ Adds healing (team had none)"); }
   return {b,why};
 }
 function buildTeam(c){
@@ -4540,8 +4573,11 @@ function buildTeam(c){
     if(n==="break") requirements.push({label:"a Breaker", test:u=>u.role==="Breaker"});
     else requirements.push({label:TRAIT_LABEL[n]||n, test:u=>u.traits.includes(n)});
   });
-  requirements.push({label:"arts battery", test:u=>u.traits.includes("artsBattery")});
-  requirements.push({label:"a healer", test:u=>u.role==="Healer"});
+  /* Arts-battery and healer are intentionally NOT hard requirements. Trait tags
+     are imperfect, and force-slotting a "battery"/healer can displace a stronger
+     unit and produce a worse team. They're handled as soft coverage bonuses in
+     synergyBonus() instead — preferred, never forced. Only the fight's curated
+     mechanics (c.need) are hard requirements. */
   requirements.forEach(req=>{
     if(team.length>=4) return;
     /* among units satisfying the requirement, pick by base score + synergy with picks so far */
@@ -4606,7 +4642,7 @@ function renderTeam(){
       <div class="flex-between"><div><b><span class="el ${p.u.el.toLowerCase()}"></span>${p.u.name}</b>${p.u.tw?` <b class="chip tw">TW</b>`:""} <span class="muted small">${p.u.el} · ${p.u.role}${p.u.tier?" · "+p.u.tier:""}</span></div>${advtxt}</div>
       <div>${p.u.traits.map(t=>`<span class="chip">${TRAIT_LABEL[t]||t}</span>`).join("")}</div>
       <div class="why">${p.reasons.slice(0,4).join(" &nbsp;·&nbsp; ")||"Best remaining unit by score."}</div>
-      ${p.u.slots?`<div class="why">🛡 Equip: `+p.u.slots.map(st=>{const e=suggestEquip(st,c); return `<b>${EQ_TYPE_LABEL[st.split("/")[0]]||st}</b>${e?` → ${e.name}`:""}`;}).join(" &nbsp;·&nbsp; ")+`</div>`:""}
+      ${p.u.slots?`<div class="why">🛡 Equip: `+p.u.slots.map(st=>{const e=suggestEquip(st,c); return `<b>${slotTypeLabel(st.type)}${slotCapLabel(st.cap)}</b>${e?` → ${e.name} (${e.star}★)`:` → <span class="muted">none ≤${st.cap}★</span>`}`;}).join(" &nbsp;·&nbsp; ")+`</div>`:""}
     </div></div>`;
   });
   html+=`<div class="note">🛡 Equip picks ${ownedEq.size>0?`are limited to the <b>${ownedEq.size}</b> equips you marked owned (tab 2)`:`use the whole database — mark the equips you own in tab 2 to keep them realistic`}. Recommendations also improve as you tag roles/traits on your units (✎ in tab 1).</div></div>`;
@@ -4709,6 +4745,19 @@ function initTraitBox(sel){
   const box=document.getElementById("uTraits"); box.innerHTML="";
   TRAITS.forEach(t=>{ const on=sel&&sel.includes(t)?"checked":""; box.insertAdjacentHTML("beforeend",`<label><input type="checkbox" value="${t}" ${on}> ${TRAIT_LABEL[t]}</label>`); });
 }
+function buildSlotCapUI(u){
+  const wrap=document.getElementById("uSlotWrap"), box=document.getElementById("uSlots");
+  box.innerHTML="";
+  if(!u || !u.slots || !u.slots.length){ wrap.style.display="none"; return; }
+  wrap.style.display="";
+  u.slots.forEach((s,i)=>{
+    let opts=`<option value="">— (≤${MAX_EQUIP_STAR}★)</option>`;
+    for(let n=MAX_EQUIP_STAR;n>=1;n--) opts+=`<option value="${n}" ${s.cap===n&&s.cap<MAX_EQUIP_STAR?"selected":""}>≤${n}★</option>`;
+    box.insertAdjacentHTML("beforeend",
+      `<div style="flex:1;min-width:96px"><label class="f" style="margin:0 0 3px">Slot ${i+1} · ${slotTypeLabel(s.type)}</label>
+       <select class="uSlotCap" data-i="${i}" style="width:100%">${opts}</select></div>`);
+  });
+}
 function openEdit(u){
   editing=u;
   document.getElementById("dlgTitle").textContent="Edit "+u.name;
@@ -4718,6 +4767,7 @@ function openEdit(u){
   document.getElementById("uTier").value=u.tier||"";
   document.getElementById("uTW").checked=!!u.tw;
   initTraitBox(u.traits);
+  buildSlotCapUI(u);
   document.getElementById("uOwnToggle").style.display="";
   document.getElementById("unitDlg").showModal();
 }
@@ -4728,6 +4778,7 @@ function openAdd(){
   document.getElementById("uElement").value="Fire"; document.getElementById("uRole").value="Attacker"; document.getElementById("uTier").value="";
   document.getElementById("uTW").checked=false;
   initTraitBox([]);
+  buildSlotCapUI(null);
   document.getElementById("uOwnToggle").style.display="none";
   document.getElementById("unitDlg").showModal();
 }
@@ -4783,6 +4834,12 @@ document.getElementById("uSave").onclick=()=>{
   const tw=document.getElementById("uTW").checked;
   if(editing){
     editing.role=role; editing.traits=traits; editing.tier=tier; editing.tw=tw; if(editing.custom) editing.el=el;
+    if(editing.slots && editing.slots.length){
+      document.querySelectorAll("#uSlots .uSlotCap").forEach(sel=>{
+        const i=+sel.dataset.i; const v=sel.value;
+        if(editing.slots[i]) editing.slots[i].cap = v==="" ? MAX_EQUIP_STAR : Math.max(1,Math.min(MAX_EQUIP_STAR,+v));
+      });
+    }
     saveEdit(editing); if(editing.custom) saveCustom();
   } else {
     const name=document.getElementById("uName").value.trim(); if(!name){alert("Enter a name");return;}

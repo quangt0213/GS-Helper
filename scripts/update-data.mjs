@@ -91,35 +91,56 @@ function* walk(dir) {
 }
 
 /**
- * v2 parser. JSON files -> JSON.parse. JS/TS module files -> evaluate in a bare
- * vm sandbox (no globals, no require/import, 2s timeout). Import lines are
- * stripped; `export default X` and `export const NAME = X` are captured. Files
- * with real logic (functions, JSX, requires) simply throw inside the sandbox
- * and are skipped — only pure data literals survive, which is exactly what we want.
+ * v2.1 parser. JSON files -> JSON.parse. JS/TS module files -> evaluate in a bare
+ * vm sandbox (no globals/require/import, 4s timeout). The tricky part is `export`:
+ * a vm script is NOT a module, so any surviving `export` keyword is a syntax error.
+ * Earlier versions only stripped exports that sat on their own line; the real
+ * GSReact data files place `export` elsewhere, so we now remove EVERY export form
+ * position-independently and convert exported declarations to `var` (top-level
+ * `var` attaches to the sandbox global, unlike const/let, so we can read it back).
+ * Files with real logic (JSX, function bodies referencing React, etc.) still throw
+ * and are skipped — only pure data literals survive, which is what we want.
  */
 function parseDataFile(p) {
   let text;
   try { text = fs.readFileSync(p, "utf8"); } catch { return { data: null, note: "unreadable" }; }
-  if (text.length > 30_000_000) return { data: null, note: "too large" };
+  if (text.length > 40_000_000) return { data: null, note: "too large" };
   if (p.endsWith(".json")) {
     try { return { data: JSON.parse(text) }; } catch { return { data: null, note: "bad JSON" }; }
   }
   if (!/[\[{]/.test(text)) return { data: null, note: "no literals" };
+
+  // Capture the names of exported top-level bindings from the ORIGINAL text so we
+  // can read their values back out of the sandbox after evaluation.
+  const names = new Set();
+  let mm; const nameRe = /\bexport\s+(?:const|let|var)\s+(\w+)/g;
+  while ((mm = nameRe.exec(text))) names.add(mm[1]);
+
   const prepped = text
-    .replace(/^\s*import[^;\n]*;?\s*$/gm, "")                 // strip import lines
-    .replace(/^\s*export\s+default\s+/m, "__ret = ")           // capture default export
-    .replace(/export\s+(const|let|var)\s+(\w+)\s*=/g, "__all.$2 =") // capture named exports
-    .replace(/module\.exports\s*=\s*/g, "__ret = ")
-    .replace(/^\s*export\s*\{[^}]*\}\s*;?\s*$/gm, "");
-  const sandbox = { __all: {}, __ret: undefined };
+    .replace(/^\s*import\b[^\n]*$/gm, "")                                   // strip import lines
+    .replace(/\bexport\s+default\s+/g, "__ret = ")                          // export default X   (anywhere)
+    .replace(/\bexport\s*\{[^}]*\}\s*(?:from\s*['"][^'"]*['"])?\s*;?/g, "")  // export { ... } [from '...']
+    .replace(/\bexport\s*\*\s*(?:as\s+\w+\s*)?from\s*['"][^'"]*['"]\s*;?/g, "") // export * from '...'
+    .replace(/\bexport\s+(?:const|let|var)\s+/g, "var ")                    // export const X -> var X (attaches to sandbox)
+    .replace(/\bexport\s+(?:async\s+)?function\s+/g, "function ")           // export function
+    .replace(/\bexport\s+class\s+/g, "class ")                              // export class
+    .replace(/\bmodule\.exports\s*=\s*/g, "__ret = ")                       // CommonJS default
+    .replace(/\bexport\s+/g, "");                                           // any stray export keyword
+
+  const sandbox = { __ret: undefined };
   try {
-    vm.runInNewContext(prepped, sandbox, { timeout: 2000, filename: p });
+    vm.runInNewContext(prepped, sandbox, { timeout: 4000, filename: p });
   } catch (e) { return { data: null, note: "eval: " + String(e.message).slice(0, 60) }; }
-  const named = Object.keys(sandbox.__all).length ? sandbox.__all : null;
-  const data = sandbox.__ret !== undefined
-    ? (named ? { __default: sandbox.__ret, ...named } : sandbox.__ret)
-    : named;
-  return data ? { data } : { data: null, note: "no exports captured" };
+
+  const collected = {};
+  for (const n of names) if (sandbox[n] !== undefined) collected[n] = sandbox[n];
+  if (sandbox.__ret !== undefined) collected.__default = sandbox.__ret;
+  // last-resort: any array-ish globals the sandbox picked up
+  for (const k of Object.keys(sandbox)) {
+    if (k === "__ret" || collected[k] !== undefined) continue;
+    if (Array.isArray(sandbox[k]) || (sandbox[k] && typeof sandbox[k] === "object")) collected[k] = sandbox[k];
+  }
+  return Object.keys(collected).length ? { data: collected } : { data: null, note: "no exports captured" };
 }
 
 /** Collect every array-of-plain-objects (len>=25) nested anywhere in a value. */
@@ -268,7 +289,10 @@ function deriveTraits(text) {
   if (/taunt/.test(t)) add("taunt");
   if (/(reduc\w+ (all )?(allies'?|target'?s?) dmg taken|dmg taken by)/.test(t)) add("mitigation");
   if (/(heals? .{0,30}(status|ailment)|removes .{0,20}(status|ailment)|cures)/.test(t)) add("cleanse");
-  if (/arts gauge/.test(t) && /(allies|party)/.test(t)) add("artsBattery");
+  /* True arts battery = fills ALL ALLIES' arts gauge by a concrete amount.
+     Excludes common false positives: "own arts gauge", "when arts gauge is full",
+     small self-fills — none of which make a unit a team battery. */
+  if (/(all allies|party|allies['’])\s*(')?\s*arts\s*(gauge\s*)?(by\s*)?\+?\d/.test(t)) add("artsBattery");
   if (/true dmg|true damage/.test(t)) add("trueDamage");
   if (/all enemies/.test(t)) add("aoe");
   if (/reviv|recover(s|y) from ko/.test(t)) add("revive");
@@ -321,7 +345,20 @@ const slotKey = bestKeyBy(unitSrc.arr, k => {
   });
   return hit;
 }).key;
-log(`unit fields — element:'${uEl.key}' img:'${uImgKey || "-"}' slots:'${slotKey || "-"}'`);
+/* Optional per-slot star caps: a field holding 3 small numbers (1..MAX) parallel
+   to the slot types, e.g. slotRarity:[6,6,5] or slotStar:"5,5,4". */
+const MAX_EQUIP_STAR = 5;
+const slotCapKey = bestKeyBy(unitSrc.arr, k => {
+  if (k === slotKey) return 0;
+  let hit = 0;
+  unitSrc.arr.slice(0, 60).forEach(o => {
+    const v = o[k]; const arr = Array.isArray(v) ? v : typeof v === "string" ? v.split(/[,/]/) : [];
+    const nums = arr.map(x => parseInt(x, 10)).filter(n => !isNaN(n));
+    if (nums.length >= 2 && nums.every(n => n >= 1 && n <= 6)) hit++;
+  });
+  return /(slot).*(rarity|star|cap|rank)|(rarity|star|cap).*slot/i.test(k) ? hit * 3 : hit;
+}).key;
+log(`unit fields — element:'${uEl.key}' img:'${uImgKey || "-"}' slots:'${slotKey || "-"}' slotCaps:'${slotCapKey || "-"}'`);
 
 const addUnitLines = [], addKitLines = [], addSlotLines = [], addUImgLines = [];
 for (const o of unitSrc.arr) {
@@ -339,7 +376,18 @@ for (const o of unitSrc.arr) {
     const v = o[slotKey];
     const rawSlots = Array.isArray(v) ? v : typeof v === "string" ? v.split(/[,/]/) : [];
     const mapped = rawSlots.map(s => EQ_TYPES[String(s).trim().toLowerCase()] || "").filter(Boolean);
-    if (mapped.length >= 3) addSlotLines.push(`${name} (${el})|${mapped.slice(0, 3).join(",")}`);
+    let caps = [];
+    if (slotCapKey && o[slotCapKey] != null) {
+      const cv = o[slotCapKey];
+      caps = (Array.isArray(cv) ? cv : String(cv).split(/[,/]/)).map(x => parseInt(x, 10));
+    }
+    if (mapped.length >= 3) {
+      const toks = mapped.slice(0, 3).map((tp, i) => {
+        const cap = caps[i];
+        return (cap >= 1 && cap < MAX_EQUIP_STAR) ? `${tp}:${cap}` : tp; // only annotate real restrictions
+      });
+      addSlotLines.push(`${name} (${el})|${toks.join(",")}`);
+    }
   }
   if (uImgKey && o[uImgKey] != null) { addUImgLines.push(`${name} (${el})|${String(o[uImgKey]).trim()}`); report.newUImg++; }
   report.newUnits.push(`${name} (${el}) — ${role}${traits.length ? " · " + traits.join(",") : ""}`);

@@ -1,0 +1,44 @@
+name: Daily data update
+
+on:
+  schedule:
+    # every day at 09:17 UTC (odd minute avoids GitHub's top-of-hour congestion)
+    - cron: "17 9 * * *"
+  workflow_dispatch: {}   # lets you run it manually from the Actions tab
+
+permissions:
+  contents: write
+
+concurrency:
+  group: data-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Clone data source (grandsummoners.info source repo)
+        run: git clone --depth 1 https://github.com/Reymdusk/GSReact /tmp/GSReact
+
+      - name: Update data blocks in index.html
+        run: node scripts/update-data.mjs /tmp/GSReact --index index.html
+
+      - name: Commit & push if anything changed
+        run: |
+          if git diff --quiet; then
+            echo "No data changes today — nothing to commit."
+            exit 0
+          fi
+          git config user.name  "gs-helper-data-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          git commit -m "chore(data): daily refresh ($(date -u +%Y-%m-%d))"
+          git push

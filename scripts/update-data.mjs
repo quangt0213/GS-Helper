@@ -91,27 +91,102 @@ function* walk(dir) {
 }
 
 /**
- * v2.2 parser. JSON -> JSON.parse. JS module files -> evaluate as a bare *script*
- * in a vm sandbox (no globals/require/import, 5s timeout). Two hurdles with real
- * GSReact files: (1) `export` is illegal in a script, and (2) the data is declared
- * as `const unitInfo = [...]` and exported separately via `export { unitInfo }`,
- * so the binding is block-scoped and never reaches the sandbox global. We handle
- * both by stripping every export form (keeping the underlying declaration intact)
- * and then APPENDING capture code that reads each exported name from within the
- * same script scope — const/let bindings included. Component files with real JSX
- * still throw and are skipped; only pure data literals survive.
+ * v3 parser — format-agnostic.
+ *
+ * Previous versions tried to emulate ES-module semantics (strip `export`, then read
+ * the exported binding back out). That is fragile: it depends on exactly how a file
+ * declares and exports its data, and real files vary.
+ *
+ * v3 doesn't care about exports at all. It scans the raw source for top-level
+ * assignments of an ARRAY or OBJECT literal (`const X = [`, `export const X = {`,
+ * `export default [`, `module.exports = {` …), brace-matches the literal with a
+ * scanner that understands strings, template literals, escapes and comments, and
+ * then evaluates ONLY that literal inside a bare vm sandbox (`__v = ( <literal> )`).
+ *
+ * Consequences:
+ *   • Works for every export style, including no export at all.
+ *   • Immune to `import` statements, JSX elsewhere in the file, and stray syntax:
+ *     only the literal text is ever evaluated.
+ *   • A literal referencing identifiers (e.g. `{icon: SOME_CONST}`) simply throws
+ *     and is skipped, so we fall back to whole-module evaluation as a second pass.
+ * The sandbox has no globals, no require/import, no fs, no network, and a timeout.
  */
+
+/** Index of the bracket that closes the one at `start`, or -1. Skips strings/comments. */
+function matchBracket(s, start) {
+  let depth = 0;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (c === "/" && s[i + 1] === "/") { const nl = s.indexOf("\n", i); if (nl < 0) return -1; i = nl; continue; }
+    if (c === "/" && s[i + 1] === "*") { const e = s.indexOf("*/", i + 2); if (e < 0) return -1; i = e + 1; continue; }
+    if (c === '"' || c === "'" || c === "`") {
+      const q = c;
+      i++;
+      for (; i < s.length; i++) {
+        if (s[i] === "\\") { i++; continue; }
+        if (s[i] === q) break;
+        if (q === "`" && s[i] === "$" && s[i + 1] === "{") {   // template expression
+          const e = matchBracket(s, i + 1);
+          if (e < 0) return -1;
+          i = e;
+        }
+      }
+      continue;
+    }
+    if (c === "[" || c === "{") depth++;
+    else if (c === "]" || c === "}") { depth--; if (depth === 0) return i; }
+  }
+  return -1;
+}
+
+/** Every top-level `NAME = <array|object literal>` in the source, as raw code strings. */
+function extractLiterals(text) {
+  const out = [];
+  const re = /(?:\bexport\s+default\s+|\bmodule\.exports\s*=\s*|(?:\bexport\s+)?\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*)/g;
+  let m;
+  while ((m = re.exec(text))) {
+    let i = m.index + m[0].length;
+    while (i < text.length && /\s/.test(text[i])) i++;
+    const ch = text[i];
+    if (ch !== "[" && ch !== "{") continue;
+    const end = matchBracket(text, i);
+    if (end < 0) continue;
+    out.push({ name: m[1] || "__default", code: text.slice(i, end + 1) });
+    re.lastIndex = end;                       // resume after this literal
+  }
+  return out;
+}
+
 function parseDataFile(p) {
   let text;
   try { text = fs.readFileSync(p, "utf8"); } catch { return { data: null, note: "unreadable" }; }
   if (text.length > 40_000_000) return { data: null, note: "too large" };
+  text = text.replace(/^\uFEFF/, "");                    // strip BOM
   if (p.endsWith(".json")) {
     try { return { data: JSON.parse(text) }; } catch { return { data: null, note: "bad JSON" }; }
   }
   if (!/[\[{]/.test(text)) return { data: null, note: "no literals" };
 
-  // Collect every exported LOCAL binding name: `export const/let/var NAME`, and
-  // the local names inside `export { a, b as c }` lists.
+  /* --- pass 1: evaluate each top-level literal on its own (format-agnostic) --- */
+  const collected = {};
+  let literals = [];
+  try { literals = extractLiterals(text); } catch { /* fall through */ }
+  for (const lit of literals) {
+    if (lit.code.length < 40) continue;                  // skip trivia like {} or []
+    const sandbox = { __v: undefined };
+    try {
+      vm.runInNewContext("__v = (" + lit.code + ")", sandbox, { timeout: 5000, filename: p });
+    } catch { continue; }                                // references identifiers / not pure data
+    if (sandbox.__v && typeof sandbox.__v === "object") {
+      const prev = collected[lit.name];
+      const size = Array.isArray(sandbox.__v) ? sandbox.__v.length : Object.keys(sandbox.__v).length;
+      const prevSize = prev ? (Array.isArray(prev) ? prev.length : Object.keys(prev).length) : -1;
+      if (size > prevSize) collected[lit.name] = sandbox.__v;   // keep the richest literal per name
+    }
+  }
+  if (Object.keys(collected).length) return { data: collected };
+
+  /* --- pass 2 (fallback): whole-module evaluation, exports stripped --- */
   const names = new Set();
   let m;
   const declRe = /\bexport\s+(?:const|let|var)\s+(\w+)/g;
@@ -123,10 +198,8 @@ function parseDataFile(p) {
       if (/^[A-Za-z_$][\w$]*$/.test(local)) names.add(local);
     });
   }
-
-  // Strip/neutralize every export form so the file is a valid script, but KEEP the
-  // declaration keyword (so `export const X` -> `const X`, still a real binding).
   let prepped = text
+    .replace(/^\s*import\b[\s\S]*?from\s*['"][^'"]*['"]\s*;?/gm, "")   // incl. multi-line imports
     .replace(/^\s*import\b[^\n]*$/gm, "")
     .replace(/\bexport\s+default\s+/g, "__ret = ")
     .replace(/\bexport\s*\{[^}]*\}\s*(?:from\s*['"][^'"]*['"])?\s*;?/g, "")
@@ -135,26 +208,22 @@ function parseDataFile(p) {
     .replace(/\bexport\s+((?:async\s+)?function|class)\s+/g, "$1 ")
     .replace(/\bmodule\.exports\s*=\s*/g, "__ret = ")
     .replace(/\bexport\s+/g, "");
-
-  // Append in-scope capture: reads each exported name (const/let/var alike) into a
-  // sandbox-visible object. A `try` guards names that don't resolve.
   prepped = "var __cap = {};\n" + prepped + "\n;(function(){\n";
   for (const n of names) prepped += `  try { __cap[${JSON.stringify(n)}] = ${n}; } catch (e) {}\n`;
   prepped += "})();\n";
 
   const sandbox = { __ret: undefined, __cap: undefined };
   try {
-    vm.runInNewContext(prepped, sandbox, { timeout: 5000, filename: p });
+    vm.runInNewContext(prepped, sandbox, { timeout: 8000, filename: p });
   } catch (e) { return { data: null, note: "eval: " + String(e.message).slice(0, 60) }; }
-
-  const collected = {};
-  if (sandbox.__cap) Object.assign(collected, sandbox.__cap);
-  if (sandbox.__ret !== undefined) collected.__default = sandbox.__ret;
+  const out = {};
+  if (sandbox.__cap) Object.assign(out, sandbox.__cap);
+  if (sandbox.__ret !== undefined) out.__default = sandbox.__ret;
   for (const k of Object.keys(sandbox)) {
-    if (k === "__ret" || k === "__cap" || collected[k] !== undefined) continue;
-    if (Array.isArray(sandbox[k]) || (sandbox[k] && typeof sandbox[k] === "object")) collected[k] = sandbox[k];
+    if (k === "__ret" || k === "__cap" || out[k] !== undefined) continue;
+    if (sandbox[k] && typeof sandbox[k] === "object") out[k] = sandbox[k];
   }
-  return Object.keys(collected).length ? { data: collected } : { data: null, note: "no exports captured" };
+  return Object.keys(out).length ? { data: out } : { data: null, note: "no data literals found" };
 }
 
 /** Collect every array-of-plain-objects (len>=25) nested anywhere in a value. */
@@ -185,7 +254,22 @@ log(`scanned ${scanned.length} candidate files, parsed ${parsedFiles.length}`);
 function discoveryReport() {
   const rows = scanned.sort((a, b) => b.size - a.size).slice(0, 25)
     .map(s => `  ${s.ok ? "✓" : "✗"} ${(s.size/1024).toFixed(0).padStart(6)} KB  ${path.relative(SRC_DIR, s.p)}  ${s.ok ? "" : "(" + s.note + ")"}`);
-  return "Largest candidate files (✓ parsed / ✗ skipped):\n" + rows.join("\n");
+  let out = "Largest candidate files (✓ parsed / ✗ skipped):\n" + rows.join("\n");
+  /* If the biggest files failed, show what they actually look like — so a format
+     surprise is visible in the log instead of requiring another guess. */
+  const bigFails = scanned.filter(s => !s.ok && s.size > 100_000).sort((a, b) => b.size - a.size).slice(0, 2);
+  for (const s of bigFails) {
+    let head = "";
+    try {
+      const t = fs.readFileSync(s.p, "utf8").replace(/^\uFEFF/, "");
+      const decls = [...t.matchAll(/^.*\b(?:export|const|let|var|module\.exports)\b.*$/gm)]
+        .map(x => x[0].trim()).filter(x => x.length < 160).slice(0, 8);
+      head = "\n  first 240 chars: " + JSON.stringify(t.slice(0, 240)) +
+             "\n  declaration-ish lines:\n" + (decls.map(d => "    " + d).join("\n") || "    (none found)");
+    } catch { head = "\n  (could not read)"; }
+    out += `\n\nSTRUCTURE OF ${path.relative(SRC_DIR, s.p)}:${head}`;
+  }
+  return out;
 }
 if (parsedFiles.length === 0) fail("no parseable data files found in source clone.\n" + discoveryReport());
 

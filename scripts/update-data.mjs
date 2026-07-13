@@ -91,15 +91,15 @@ function* walk(dir) {
 }
 
 /**
- * v2.1 parser. JSON files -> JSON.parse. JS/TS module files -> evaluate in a bare
- * vm sandbox (no globals/require/import, 4s timeout). The tricky part is `export`:
- * a vm script is NOT a module, so any surviving `export` keyword is a syntax error.
- * Earlier versions only stripped exports that sat on their own line; the real
- * GSReact data files place `export` elsewhere, so we now remove EVERY export form
- * position-independently and convert exported declarations to `var` (top-level
- * `var` attaches to the sandbox global, unlike const/let, so we can read it back).
- * Files with real logic (JSX, function bodies referencing React, etc.) still throw
- * and are skipped — only pure data literals survive, which is what we want.
+ * v2.2 parser. JSON -> JSON.parse. JS module files -> evaluate as a bare *script*
+ * in a vm sandbox (no globals/require/import, 5s timeout). Two hurdles with real
+ * GSReact files: (1) `export` is illegal in a script, and (2) the data is declared
+ * as `const unitInfo = [...]` and exported separately via `export { unitInfo }`,
+ * so the binding is block-scoped and never reaches the sandbox global. We handle
+ * both by stripping every export form (keeping the underlying declaration intact)
+ * and then APPENDING capture code that reads each exported name from within the
+ * same script scope — const/let bindings included. Component files with real JSX
+ * still throw and are skipped; only pure data literals survive.
  */
 function parseDataFile(p) {
   let text;
@@ -110,34 +110,48 @@ function parseDataFile(p) {
   }
   if (!/[\[{]/.test(text)) return { data: null, note: "no literals" };
 
-  // Capture the names of exported top-level bindings from the ORIGINAL text so we
-  // can read their values back out of the sandbox after evaluation.
+  // Collect every exported LOCAL binding name: `export const/let/var NAME`, and
+  // the local names inside `export { a, b as c }` lists.
   const names = new Set();
-  let mm; const nameRe = /\bexport\s+(?:const|let|var)\s+(\w+)/g;
-  while ((mm = nameRe.exec(text))) names.add(mm[1]);
+  let m;
+  const declRe = /\bexport\s+(?:const|let|var)\s+(\w+)/g;
+  while ((m = declRe.exec(text))) names.add(m[1]);
+  const listRe = /\bexport\s*\{([^}]*)\}/g;
+  while ((m = listRe.exec(text))) {
+    m[1].split(",").forEach(part => {
+      const local = part.trim().split(/\s+as\s+/)[0].trim();
+      if (/^[A-Za-z_$][\w$]*$/.test(local)) names.add(local);
+    });
+  }
 
-  const prepped = text
-    .replace(/^\s*import\b[^\n]*$/gm, "")                                   // strip import lines
-    .replace(/\bexport\s+default\s+/g, "__ret = ")                          // export default X   (anywhere)
-    .replace(/\bexport\s*\{[^}]*\}\s*(?:from\s*['"][^'"]*['"])?\s*;?/g, "")  // export { ... } [from '...']
-    .replace(/\bexport\s*\*\s*(?:as\s+\w+\s*)?from\s*['"][^'"]*['"]\s*;?/g, "") // export * from '...'
-    .replace(/\bexport\s+(?:const|let|var)\s+/g, "var ")                    // export const X -> var X (attaches to sandbox)
-    .replace(/\bexport\s+(?:async\s+)?function\s+/g, "function ")           // export function
-    .replace(/\bexport\s+class\s+/g, "class ")                              // export class
-    .replace(/\bmodule\.exports\s*=\s*/g, "__ret = ")                       // CommonJS default
-    .replace(/\bexport\s+/g, "");                                           // any stray export keyword
+  // Strip/neutralize every export form so the file is a valid script, but KEEP the
+  // declaration keyword (so `export const X` -> `const X`, still a real binding).
+  let prepped = text
+    .replace(/^\s*import\b[^\n]*$/gm, "")
+    .replace(/\bexport\s+default\s+/g, "__ret = ")
+    .replace(/\bexport\s*\{[^}]*\}\s*(?:from\s*['"][^'"]*['"])?\s*;?/g, "")
+    .replace(/\bexport\s*\*\s*(?:as\s+\w+\s*)?from\s*['"][^'"]*['"]\s*;?/g, "")
+    .replace(/\bexport\s+(const|let|var)\s+/g, "$1 ")
+    .replace(/\bexport\s+((?:async\s+)?function|class)\s+/g, "$1 ")
+    .replace(/\bmodule\.exports\s*=\s*/g, "__ret = ")
+    .replace(/\bexport\s+/g, "");
 
-  const sandbox = { __ret: undefined };
+  // Append in-scope capture: reads each exported name (const/let/var alike) into a
+  // sandbox-visible object. A `try` guards names that don't resolve.
+  prepped = "var __cap = {};\n" + prepped + "\n;(function(){\n";
+  for (const n of names) prepped += `  try { __cap[${JSON.stringify(n)}] = ${n}; } catch (e) {}\n`;
+  prepped += "})();\n";
+
+  const sandbox = { __ret: undefined, __cap: undefined };
   try {
-    vm.runInNewContext(prepped, sandbox, { timeout: 4000, filename: p });
+    vm.runInNewContext(prepped, sandbox, { timeout: 5000, filename: p });
   } catch (e) { return { data: null, note: "eval: " + String(e.message).slice(0, 60) }; }
 
   const collected = {};
-  for (const n of names) if (sandbox[n] !== undefined) collected[n] = sandbox[n];
+  if (sandbox.__cap) Object.assign(collected, sandbox.__cap);
   if (sandbox.__ret !== undefined) collected.__default = sandbox.__ret;
-  // last-resort: any array-ish globals the sandbox picked up
   for (const k of Object.keys(sandbox)) {
-    if (k === "__ret" || collected[k] !== undefined) continue;
+    if (k === "__ret" || k === "__cap" || collected[k] !== undefined) continue;
     if (Array.isArray(sandbox[k]) || (sandbox[k] && typeof sandbox[k] === "object")) collected[k] = sandbox[k];
   }
   return Object.keys(collected).length ? { data: collected } : { data: null, note: "no exports captured" };

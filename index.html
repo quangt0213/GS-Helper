@@ -97,7 +97,7 @@
 <header>
   <a class="btn sm suggest" href="mailto:quangt0213@gmail.com?subject=Grand%20Summoners%20Helper%20%E2%80%94%20Suggestion&body=My%20suggestion%2Ffeedback%3A%0A%0A">💬 Suggestion</a>
   <h1>⚔️ Grand Summoners Helper <span class="muted" style="font-size:13px;font-weight:400">· prototype</span></h1>
-  <p>Main Quests &amp; Giant Bosses · ~480 units with real elements, tiers (SS–F) and skill-derived roles &amp; traits. Everything is editable per unit (✎). <span class="muted">Data snapshot: <b id="dataStamp">—</b></span></p>
+  <p>Main Quests &amp; Giant Bosses · ~490 units with real elements, tiers (SS–F) and skill-derived roles &amp; traits. Everything is editable per unit (✎). <span class="muted">Data snapshot: <b id="dataStamp">—</b></span></p>
 </header>
 
 <div class="tabs">
@@ -782,6 +782,8 @@ Fire Reinhard
 Earth Echidna
 Dark Demon Rem
 Water Bridal Emilia
+Dark Simon the Eradicator
+Fire Summer Char & Valerie
 </script>
 
 <!-- Real tier list scraped from grandsummoners.info/tierlist (Global) -->
@@ -1699,6 +1701,8 @@ Fire|Support|Reinhard|paralysis,freeze,artsBattery
 Earth|Healer|Echidna|paralysis,freeze,cleanse,artsBattery,revive
 Dark|Attacker|Demon Rem|
 Water|Healer|Bridal Emilia|poison
+Dark|Attacker|Simon the Eradicator|
+Fire|Support|Summer Char & Valerie|freeze,artsBattery
 </script>
 
 <!-- Per-unit equipment slot types (phys/mag/supp/heal/def; "/" = choice). From the site data bundle. Format: Name|s1,s2,s3
@@ -3704,6 +3708,8 @@ Reinhard (Fire)|108437112
 Echidna (Earth)|108447312
 Demon Rem (Dark)|108457512
 Bridal Emilia (Water)|108467212
+Simon the Eradicator (Dark)|104307512
+Summer Char & Valerie (Fire)|104337112
 </script>
 
 <!-- Equip thumbnail image IDs (name|id). Icon URL = /db/Equipment/Thumbnail/item_thumbnail_<id>.png -->
@@ -4255,7 +4261,7 @@ Cleaning Robot Drum Model|154491
 /* ---------------- ELEMENT SYSTEM ---------------- */
 const BEATS = {Fire:"Earth", Earth:"Water", Water:"Fire", Light:"Dark", Dark:"Light"};
 /* Bump this whenever unit/tier/equip data is re-scraped from the sources */
-const DATA_UPDATED = "July 13, 2026";
+const DATA_UPDATED = "July 18, 2026";
 function advantage(unitEl, enemyEl){
   if(!enemyEl) return 0;
   if(BEATS[unitEl]===enemyEl) return 2;
